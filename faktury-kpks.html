@@ -1,0 +1,683 @@
+<html lang="pl"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              window.parent.postMessage({
+                type: 'screenshotData',
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Faktury K.P. K.S.</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: Arial, sans-serif; background: #f4f6fa; color: #1a2e50; }
+
+/* EKRAN FORMULARZA */
+#ekranForma { display: block; }
+#ekranFaktury { display: none; }
+
+.header { background: #1a2e50; color: white; padding: 14px 20px; display: flex; align-items: center; justify-content: space-between; }
+.header h1 { font-size: 18px; letter-spacing: 1px; }
+.header p { font-size: 10px; color: #8aadd4; letter-spacing: 3px; margin-top: 2px; }
+
+.tabs { display: flex; background: white; border-bottom: 2px solid #dde3ec; }
+.tab { flex: 1; padding: 14px; text-align: center; font-size: 13px; font-weight: 700; color: #6b7f9e; cursor: pointer; border-bottom: 3px solid transparent; margin-bottom: -2px; }
+.tab.active { color: #1a2e50; border-bottom-color: #1a2e50; }
+
+.page { display: none; padding: 16px; max-width: 700px; margin: 0 auto; }
+.page.show { display: block; }
+
+.card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 16px; border: 1px solid #dde3ec; }
+.card h2 { font-size: 14px; font-weight: 700; color: #1a2e50; margin-bottom: 16px; padding-bottom: 10px; border-bottom: 1px solid #dde3ec; }
+
+.field { margin-bottom: 12px; }
+.field label { display: block; font-size: 11px; font-weight: 700; color: #6b7f9e; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
+.field input, .field textarea {
+  width: 100%; padding: 11px 12px; border: 1.5px solid #dde3ec;
+  border-radius: 6px; font-size: 15px; color: #1a2e50; background: #f8f9fc;
+  -webkit-appearance: none; appearance: none; font-family: Arial, sans-serif;
+}
+.field textarea { min-height: 70px; resize: vertical; }
+
+.r2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.r3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+@media(max-width:520px) { .r2,.r3 { grid-template-columns: 1fr; } }
+
+.toggle { display: flex; border: 1.5px solid #dde3ec; border-radius: 8px; overflow: hidden; margin-bottom: 16px; }
+.toggle input[type=radio] { display: none; }
+.toggle label { flex: 1; padding: 13px 6px; text-align: center; font-size: 14px; font-weight: 600; color: #6b7f9e; background: #f4f6fa; cursor: pointer; }
+.toggle input[type=radio]:checked + label { background: #1a2e50; color: white; }
+
+.curr { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; }
+.curr span { font-size: 12px; color: #6b7f9e; font-weight: 700; }
+.curr input[type=radio] { display: none; }
+.curr label { padding: 8px 18px; border-radius: 20px; border: 1.5px solid #dde3ec; background: #f4f6fa; color: #6b7f9e; font-size: 13px; font-weight: 700; cursor: pointer; }
+.curr input[type=radio]:checked + label { background: #1a2e50; color: white; border-color: #1a2e50; }
+
+.notice { background: #e8eef6; border-left: 3px solid #4a6fa5; border-radius: 4px; padding: 10px 14px; font-size: 12px; color: #1a2e50; margin-bottom: 14px; }
+
+.btns { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px; padding-bottom: 40px; }
+.btns button { -webkit-appearance: none; appearance: none; border-radius: 6px; padding: 15px 22px; font-size: 15px; font-weight: 700; cursor: pointer; font-family: Arial, sans-serif; }
+.b1 { background: #1a2e50; color: white; border: none; }
+.b2 { background: white; color: #1a2e50; border: 2px solid #1a2e50; }
+.b3 { background: white; color: #4a6fa5; border: 2px solid #4a6fa5; }
+
+.inv-row { background: white; border: 1px solid #dde3ec; border-radius: 8px; padding: 14px 16px; margin-bottom: 10px; }
+.inv-top { display: flex; justify-content: space-between; align-items: flex-start; }
+.inv-nr { font-weight: 700; font-size: 15px; }
+.inv-info { font-size: 12px; color: #6b7f9e; margin-top: 3px; }
+.inv-amt { font-weight: 700; font-size: 15px; }
+.bdel { -webkit-appearance:none; appearance:none; background: #fdf0ef; color: #c0392b; border: none; border-radius: 5px; padding: 8px 12px; font-size: 12px; font-weight: 700; cursor: pointer; margin-top: 8px; font-family: Arial, sans-serif; }
+.empty { text-align: center; padding: 50px 20px; color: #6b7f9e; font-size: 14px; }
+
+/* EKRAN FAKTURY */
+#ekranFaktury { background: white; min-height: 100vh; }
+.fv-toolbar { background: #1a2e50; padding: 12px 20px; display: flex; gap: 10px; }
+.fv-toolbar button { -webkit-appearance:none; appearance:none; border-radius: 6px; padding: 12px 20px; font-size: 14px; font-weight: 700; cursor: pointer; font-family: Arial, sans-serif; border: none; }
+.fbt1 { background: white; color: #1a2e50; }
+.fbt2 { background: #4a6fa5; color: white; }
+.fv-body { padding: 10mm 12mm; max-width: 800px; margin: 0 auto; }
+.fv-hdr { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8mm; padding-bottom: 5mm; border-bottom: 2px solid #1a2e50; }
+.fv-meta { text-align: right; }
+.fv-meta .fnr { font-size: 20px; font-weight: 700; }
+.fv-meta .fdt { font-size: 11px; color: #666; margin-top: 4px; }
+.fv-strony { display: grid; grid-template-columns: 1fr 1fr; gap: 8mm; margin-bottom: 7mm; }
+.fv-str h3 { font-size: 9px; text-transform: uppercase; letter-spacing: 2px; color: #888; margin-bottom: 4px; }
+.fv-str .fnm { font-weight: 700; font-size: 14px; margin-bottom: 3px; }
+.fv-str p { font-size: 12px; line-height: 1.7; color: #333; }
+.fv-table { width: 100%; border-collapse: collapse; margin-bottom: 7mm; }
+.fv-table th { background: #f0f4f8; padding: 8px 10px; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #888; border-bottom: 1px solid #dde3ec; text-align: left; }
+.fv-table td { padding: 10px; font-size: 13px; border-bottom: 1px solid #eee; }
+.fv-suma { margin-left: auto; width: 220px; }
+.fv-suma table { width: 100%; }
+.fv-suma td { padding: 4px 0; font-size: 13px; }
+.fv-suma .tot { font-weight: 700; font-size: 16px; border-top: 2px solid #1a2e50; padding-top: 6px; margin-top: 4px; }
+.fv-platnosc { margin-top: 7mm; padding-top: 5mm; border-top: 1px solid #dde; font-size: 11px; color: #666; line-height: 1.9; }
+.fv-platnosc strong { color: #1a2e50; }
+.fv-vat { margin-top: 6mm; font-size: 9px; color: #aaa; }
+.fv-stopka { margin-top: 14mm; display: flex; justify-content: space-between; font-size: 11px; color: #888; }
+.fv-podpis { text-align: center; border-top: 1px solid #ccc; padding-top: 4px; width: 130px; }
+
+@media print {
+  #ekranForma { display: none !important; }
+  #ekranFaktury { display: block !important; }
+  .fv-toolbar { display: none !important; }
+  .fv-body { padding: 10mm 15mm; }
+}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<!-- FORMULARZ -->
+<div id="ekranForma">
+  <div class="header">
+    <div><h1>K.P. K.S. — FAKTURY</h1><p>SAMOCHODY Z HOLANDII</p></div>
+  </div>
+  <div class="tabs">
+    <div class="tab active" id="t1" onclick="goTab(1)">Nowa faktura</div>
+    <div class="tab" id="t2" onclick="goTab(2)">Lista faktur</div>
+  </div>
+
+  <div class="page show" id="p1">
+    <div class="card">
+      <h2>Numer i daty</h2>
+      <div class="r3">
+        <div class="field"><label>Numer faktury</label><input type="text" id="fnr" style="font-weight:700;font-size:15px;background:#e8eef6;border-color:#8aadd4"></div>
+        <div class="field"><label>Data wystawienia</label><input type="date" id="fdataW"></div>
+        <div class="field"><label>Termin płatności</label><input type="date" id="fdataP"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Nabywca</h2>
+      <div class="toggle">
+        <input type="radio" name="kt" id="kInd" onchange="ustawKl(0)" checked="">
+        <label for="kInd">👤 Klient indywidualny</label>
+        <input type="radio" name="kt" id="kFirm" onchange="ustawKl(1)">
+        <label for="kFirm">🏢 Firma</label>
+      </div>
+      <div id="dInd">
+        <div class="r2">
+          <div class="field"><label>Imię i nazwisko</label><input type="text" id="fimie" placeholder="Jan Kowalski"></div>
+          <div class="field"><label>PESEL (opcj.)</label><input type="text" id="fpesel" placeholder="00000000000"></div>
+        </div>
+      </div>
+      <div id="dFirm" style="display:none">
+        <div class="r2">
+          <div class="field"><label>Nazwa firmy</label><input type="text" id="ffirma" placeholder="Firma Sp. z o.o."></div>
+          <div class="field"><label>NIP</label><input type="text" id="fnip" placeholder="000-000-00-00"></div>
+        </div>
+      </div>
+      <div class="r2" style="margin-top:4px">
+        <div class="field"><label>Ulica i numer</label><input type="text" id="fulica" placeholder="ul. Przykładowa 1"></div>
+        <div class="field"><label>Kod i miasto</label><input type="text" id="fmiasto" placeholder="00-000 Miasto"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Pojazd</h2>
+      <div class="r3">
+        <div class="field"><label>Marka</label><input type="text" id="fmarka" placeholder="BMW"></div>
+        <div class="field"><label>Model</label><input type="text" id="fmodel" placeholder="320d"></div>
+        <div class="field"><label>Rok</label><input type="number" id="frok" placeholder="2020"></div>
+      </div>
+      <div class="r2" style="margin-top:4px">
+        <div class="field"><label>VIN</label><input type="text" id="fvin" placeholder="WBA..."></div>
+        <div class="field"><label>Przebieg (km)</label><input type="number" id="fprzebieg" placeholder="150000"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Kwota</h2>
+      <div class="notice">Sprzedaż używanych — procedura marży (art. 120 VAT).</div>
+      <div class="curr">
+        <span>Waluta:</span>
+        <input type="radio" name="wal" id="wPLN" onchange="ustawWal(0)" checked="">
+        <label for="wPLN">PLN</label>
+        <input type="radio" name="wal" id="wEUR" onchange="ustawWal(1)">
+        <label for="wEUR">EUR</label>
+      </div>
+      <div class="r2">
+        <div class="field"><label>Cena sprzedaży</label><input type="number" id="fcena" placeholder="0.00" step="0.01"></div>
+        <div class="field" id="dKurs" style="display:none"><label>Kurs EUR/PLN</label><input type="number" id="fkurs" placeholder="4.25" step="0.001"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Uwagi (opcjonalnie)</h2>
+      <textarea id="fuwagi" placeholder="Np. Płatność gotówką. Pojazd z Holandii."></textarea>
+    </div>
+
+    <div class="btns">
+      <button class="b1" type="button" onclick="pokazFakture()">👁 Podgląd i druk</button>
+      <button class="b2" type="button" onclick="wyczyscForm()">✕ Wyczyść</button>
+      <button class="b3" type="button" onclick="pobierzApp()">⬇ Pobierz</button>
+    </div>
+  </div>
+
+  <div class="page" id="p2">
+    <div style="padding-top:8px" id="listaDiv"></div>
+  </div>
+</div>
+
+<!-- FAKTURA (podgląd + druk) -->
+<div id="ekranFaktury">
+  <div class="fv-toolbar">
+    <button class="fbt1" type="button" onclick="wrocDoFormy()">← Wróć</button>
+    <button class="fbt2" type="button" onclick="window.print()">🖨 Drukuj / PDF</button>
+  </div>
+  <div class="fv-body" id="fvBody"></div>
+</div>
+
+<script>
+var czyFirma = false;
+var czyEUR = false;
+var lista = [];
+var rok = new Date().getFullYear();
+
+try { lista = JSON.parse(localStorage.getItem('fv2_kpks') || '[]'); } catch(e) {}
+
+window.onload = function() {
+  var dz = new Date();
+  document.getElementById('fdataW').value = dz.toISOString().split('T')[0];
+  var dp = new Date(dz); dp.setDate(dp.getDate()+14);
+  document.getElementById('fdataP').value = dp.toISOString().split('T')[0];
+  ustawNr();
+};
+
+function ustawNr() {
+  document.getElementById('fnr').value = 'FV/'+rok+'/'+padL(lista.length+1);
+}
+function padL(n) { return n < 10 ? '00'+n : n < 100 ? '0'+n : ''+n; }
+function fD(s) { if(!s) return '—'; var p=s.split('-'); return p[2]+'.'+p[1]+'.'+p[0]; }
+function f2(v) { return v.toLocaleString('pl-PL',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+
+function goTab(n) {
+  document.getElementById('p1').className = 'page'+(n==1?' show':'');
+  document.getElementById('p2').className = 'page'+(n==2?' show':'');
+  document.getElementById('t1').className = 'tab'+(n==1?' active':'');
+  document.getElementById('t2').className = 'tab'+(n==2?' active':'');
+  if (n==2) rysujListe();
+}
+
+function ustawKl(f) {
+  czyFirma = f==1;
+  document.getElementById('dInd').style.display = czyFirma ? 'none' : 'block';
+  document.getElementById('dFirm').style.display = czyFirma ? 'block' : 'none';
+}
+
+function ustawWal(e) {
+  czyEUR = e==1;
+  document.getElementById('dKurs').style.display = czyEUR ? 'block' : 'none';
+}
+
+function zbierzDane() {
+  var kl = '', klDet = '';
+  if (czyFirma) {
+    kl = (document.getElementById('ffirma').value||'').trim();
+    var n = (document.getElementById('fnip').value||'').trim();
+    if (n) klDet = 'NIP: '+n;
+  } else {
+    kl = (document.getElementById('fimie').value||'').trim();
+    var pe = (document.getElementById('fpesel').value||'').trim();
+    if (pe) klDet = 'PESEL: '+pe;
+  }
+  var ul = (document.getElementById('fulica').value||'').trim();
+  var ms = (document.getElementById('fmiasto').value||'').trim();
+  if (ul) klDet += (klDet?'\n':'')+ul;
+  if (ms) klDet += (klDet?'\n':'')+ms;
+  return {
+    nr: (document.getElementById('fnr').value||'').trim(),
+    dataW: document.getElementById('fdataW').value,
+    dataP: document.getElementById('fdataP').value,
+    cena: parseFloat(document.getElementById('fcena').value)||0,
+    kurs: parseFloat(document.getElementById('fkurs').value)||0,
+    waluta: czyEUR ? 'EUR' : 'PLN',
+    marka: (document.getElementById('fmarka').value||'').trim(),
+    model: (document.getElementById('fmodel').value||'').trim(),
+    rok: (document.getElementById('frok').value||'').trim(),
+    vin: (document.getElementById('fvin').value||'').trim(),
+    przebieg: (document.getElementById('fprzebieg').value||'').trim(),
+    uwagi: (document.getElementById('fuwagi').value||'').trim(),
+    kl: kl, klDet: klDet
+  };
+}
+
+function pokazFakture() {
+  var d = zbierzDane();
+  /* walidacja wyłączona */
+
+  lista.push({id:Date.now(), nr:d.nr, dataW:d.dataW, dataP:d.dataP,
+    cena:d.cena, kurs:d.kurs, waluta:d.waluta, marka:d.marka, model:d.model,
+    rok:d.rok, vin:d.vin, przebieg:d.przebieg, uwagi:d.uwagi, kl:d.kl, klDet:d.klDet});
+  localStorage.setItem('fv2_kpks', JSON.stringify(lista));
+
+  var opis = d.marka+' '+d.model+(d.rok?', rok '+d.rok:'');
+  var opisD = opis+(d.vin?', VIN: '+d.vin:'')+(d.przebieg?', przebieg: '+parseInt(d.przebieg).toLocaleString('pl-PL')+' km':'');
+
+  var extra = '';
+  if (d.waluta==='EUR' && d.kurs) {
+    extra = '<tr><td style="color:#888;font-size:11px">Kurs EUR: '+d.kurs.toFixed(4)+'</td><td></td></tr>'
+      +'<tr><td style="color:#888;font-size:11px">Wartość PLN</td><td style="text-align:right;font-size:11px">'+f2(d.cena*d.kurs)+' PLN</td></tr>';
+  }
+
+  document.getElementById('fvBody').innerHTML =
+    '<div class="fv-hdr">'
+    +'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 110" width="240" height="55">'
+    +'<polygon points="15,55 45,8 58,8 28,55 58,102 45,102" fill="none" stroke="#1a2e50" stroke-width="2.5" stroke-linejoin="round"/>'
+    +'<polygon points="33,55 63,8 76,8 46,55 76,102 63,102" fill="none" stroke="#4a6fa5" stroke-width="1.5" stroke-linejoin="round"/>'
+    +'<polygon points="51,55 81,8 94,8 64,55 94,102 81,102" fill="none" stroke="#8aadd4" stroke-width="1" stroke-linejoin="round"/>'
+    +'<rect x="108" y="6" width="2" height="98" fill="#1a2e50"/>'
+    +'<text x="118" y="46" font-family="Georgia,serif" font-size="34" font-weight="700" letter-spacing="2" fill="#1a2e50">K.P. K.S.</text>'
+    +'<rect x="118" y="57" width="340" height="1.5" fill="#1a2e50"/>'
+    +'<text x="119" y="76" font-family="Arial,sans-serif" font-size="10" letter-spacing="5" fill="#4a6fa5">SAMOCHODY Z HOLANDII</text>'
+    +'</svg>'
+    +'<div class="fv-meta"><div class="fnr">'+d.nr+'</div>'
+    +'<div class="fdt">Wystawiono: '+fD(d.dataW)+'</div>'
+    +'<div class="fdt">Płatność do: '+fD(d.dataP)+'</div></div>'
+    +'</div>'
+    +'<div class="fv-strony">'
+    +'<div class="fv-str"><h3>Sprzedawca</h3><div class="fnm">Kwatery Pracownicze, Karla Stankiewicz</div><p>Kostromska 62A/64<br>97-300 Piotrków Trybunalski<br>NIP: 7712920232</p></div>'
+    +'<div class="fv-str"><h3>Nabywca</h3><div class="fnm">'+d.kl+'</div><p>'+d.klDet.replace(/\n/g,'<br>')+'</p></div>'
+    +'</div>'
+    +'<table class="fv-table"><thead><tr><th>Lp.</th><th>Przedmiot sprzedaży</th><th style="text-align:right">Kwota</th></tr></thead>'
+    +'<tbody><tr><td>1.</td><td>'+opisD+'</td><td style="text-align:right;font-weight:700">'+f2(d.cena)+' '+d.waluta+'</td></tr></tbody></table>'
+    +'<div class="fv-suma"><table>'+extra
+    +'<tr><td colspan="2"><hr style="border:none;border-top:2px solid #1a2e50;margin:6px 0"></td></tr>'
+    +'<tr class="tot"><td>Do zapłaty</td><td style="text-align:right">'+f2(d.cena)+' '+d.waluta+'</td></tr>'
+    +'</table></div>'
+    +'<div class="fv-platnosc"><strong>Płatność:</strong> gotówka lub przelew<br>'
+    +'<strong>Konto PLN:</strong> 23 1140 2004 0000 3902 8252 4133'
+    +(d.uwagi ? '<br><strong>Uwagi:</strong> '+d.uwagi : '')+'</div>'
+    +'<div class="fv-vat">Procedura marży — towary używane. Art. 120 ustawy z 11.03.2004 r. o podatku od towarów i usług.</div>'
+    +'<div class="fv-stopka"><div class="fv-podpis">Sprzedawca</div><div class="fv-podpis">Nabywca</div></div>';
+
+  document.getElementById('ekranForma').style.display = 'none';
+  document.getElementById('ekranFaktury').style.display = 'block';
+  window.scrollTo(0,0);
+  ustawNr();
+}
+
+function wrocDoFormy() {
+  document.getElementById('ekranFaktury').style.display = 'none';
+  document.getElementById('ekranForma').style.display = 'block';
+  window.scrollTo(0,0);
+}
+
+function wyczyscForm() {
+  if (!confirm('Wyczyścić formularz?')) return;
+  var ids = ['fimie','fpesel','ffirma','fnip','fulica','fmiasto','fmarka','fmodel','frok','fvin','fprzebieg','fcena','fkurs','fuwagi'];
+  for (var i=0; i<ids.length; i++) { var el=document.getElementById(ids[i]); if(el) el.value=''; }
+  document.getElementById('kInd').checked = true;
+  document.getElementById('wPLN').checked = true;
+  ustawKl(0); ustawWal(0);
+}
+
+function pobierzApp() {
+  var h = document.documentElement.outerHTML;
+  var b = new Blob([h],{type:'text/html;charset=utf-8'});
+  var u = URL.createObjectURL(b);
+  var a = document.createElement('a');
+  a.href=u; a.download='faktury-kpks.html';
+  document.body.appendChild(a); a.click();
+  setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(u); },1000);
+}
+
+function rysujListe() {
+  var div = document.getElementById('listaDiv');
+  if (!lista.length) { div.innerHTML='<div class="empty">Brak faktur.<br><br>Wypełnij formularz i kliknij<br><b>Podgląd i druk</b></div>'; return; }
+  var h = '';
+  for (var i=lista.length-1; i>=0; i--) {
+    var fv = lista[i];
+    h += '<div class="inv-row">'
+      +'<div class="inv-top">'
+      +'<div><div class="inv-nr">'+fv.nr+'</div><div class="inv-info">'+fv.kl+' · '+fv.marka+' '+fv.model+(fv.rok?' '+fv.rok:'')+' · '+fD(fv.dataW)+'</div></div>'
+      +'<div class="inv-amt">'+f2(fv.cena)+' '+fv.waluta+'</div>'
+      +'</div>'
+      +'<button class="bdel" type="button" onclick="usun('+i+')">Usuń</button>'
+      +'</div>';
+  }
+  div.innerHTML = h;
+}
+
+function usun(i) {
+  if (!confirm('Usunąć?')) return;
+  lista.splice(i,1);
+  localStorage.setItem('fv2_kpks', JSON.stringify(lista));
+  ustawNr(); rysujListe();
+}
+</script>
+
+
+</body></html>
